@@ -21,11 +21,15 @@ char auto_splitter_file[PATH_MAX];
 int refresh_rate = 60;
 int maps_cache_cycles = 0; // 0=off, 1=current cycle, +1=multiple cycles
 int maps_cache_cycles_value = 0; // same as `maps_cache_cycles` but this one represents the current value rather than the reference from the script
+atomic_bool timer_started = false;
 atomic_bool auto_splitter_enabled = true;
 atomic_bool call_start = false;
+atomic_bool call_on_start = false;
 atomic_bool call_split = false;
+atomic_bool call_on_split = false;
 atomic_bool toggle_loading = false;
 atomic_bool call_reset = false;
+atomic_bool call_on_reset = false;
 bool prev_is_loading;
 
 static const char* disabled_functions[] = {
@@ -245,18 +249,37 @@ bool call_va(lua_State* L, const char* func, const char* sig, ...)
     return true;
 }
 
+int get_process_names(lua_State* L, char process_names[100][256], int* num_process_names)
+{
+    lua_getglobal(L, "State");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        while (lua_next(L, -2) != 0) {
+            if (lua_istable(L, -1)) {
+                const char* process_name = lua_tostring(L, -2);
+
+                strncpy(process_names[*num_process_names], process_name, 255);
+                process_names[*num_process_names][255] = '\0';
+                (*num_process_names)++;
+            }
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    return *num_process_names;
+}
+
 void startup(lua_State* L)
 {
-    lua_getglobal(L, "startup");
-    lua_pcall(L, 0, 0, 0);
+    call_va(L, "Startup", "");
 
-    lua_getglobal(L, "refreshRate");
+    lua_getglobal(L, "RefreshRate");
     if (lua_isnumber(L, -1)) {
         refresh_rate = lua_tointeger(L, -1);
     }
     lua_pop(L, 1); // Remove 'refreshRate' from the stack
 
-    lua_getglobal(L, "mapsCacheCycles");
+    lua_getglobal(L, "MapsCacheCycles");
     if (lua_isnumber(L, -1)) {
         maps_cache_cycles = lua_tointeger(L, -1);
         maps_cache_cycles_value = maps_cache_cycles;
@@ -264,77 +287,153 @@ void startup(lua_State* L)
     lua_pop(L, 1); // Remove 'mapsCacheCycles' from the stack
 }
 
-void state(lua_State* L)
-{
-    call_va(L, "state", "");
-}
-
-void update(lua_State* L)
-{
-    call_va(L, "update", "");
-}
-
-void start(lua_State* L)
+bool update(lua_State* L)
 {
     bool ret;
-    if (call_va(L, "start", ">b", &ret)) {
-        atomic_store(&call_start, ret);
+    if (call_va(L, "Update", ">b", &ret)) {
+        lua_pop(L, 1);
+        return ret;
     }
-    lua_pop(L, 1); // Remove the return value from the stack
+    lua_pop(L, 1);
+    return true;
 }
 
-void split(lua_State* L)
+bool start(lua_State* L)
 {
     bool ret;
-    if (call_va(L, "split", ">b", &ret)) {
-        atomic_store(&call_split, ret);
+    if (call_va(L, "Start", ">b", &ret) && ret) {
+        atomic_store(&call_start, true);
+        printf("Start: true\n");
+        lua_pop(L, 1);
+        return true;
     }
     lua_pop(L, 1); // Remove the return value from the stack
+    return false;
+}
+
+bool split(lua_State* L)
+{
+    bool ret;
+    if (call_va(L, "Split", ">b", &ret) && ret) {
+        atomic_store(&call_split, true);
+        printf("Split: true\n");
+        lua_pop(L, 1);
+        return true;
+    }
+    lua_pop(L, 1); // Remove the return value from the stack
+    return false;
 }
 
 void is_loading(lua_State* L)
 {
-    bool loading;
-    if (call_va(L, "isLoading", ">b", &loading)) {
-        if (loading != prev_is_loading) {
+    bool ret;
+    if (call_va(L, "IsLoading", ">b", &ret)) {
+        if (ret != prev_is_loading) {
             atomic_store(&toggle_loading, true);
+            printf("IsLoading: %s\n", ret ? "true" : "false");
             prev_is_loading = !prev_is_loading;
         }
     }
     lua_pop(L, 1); // Remove the return value from the stack
 }
 
-void reset(lua_State* L)
+bool reset(lua_State* L)
 {
-    bool shouldReset;
-    if (call_va(L, "reset", ">b", &shouldReset)) {
-        if (shouldReset)
-            atomic_store(&call_reset, true);
+    bool ret;
+    if (call_va(L, "Reset", ">b", &ret) && ret) {
+        atomic_store(&call_reset, true);
+        printf("Reset: true\n");
+        lua_pop(L, 1);
+        return true;
     }
-    lua_pop(L, 1); // Remove the return value from the stack
+    lua_pop(L, 1);
+    return false;
+}
+
+const char* version(lua_State* L)
+{
+    lua_getglobal(L, "Version");
+    if (lua_isstring(L, -1)) {
+        const char* version = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        printf("Version: %s\n", version);
+        return version;
+    }
+    lua_pop(L, 1);
+    return NULL;
+}
+
+bool lua_function_exists(lua_State* L, const char* func_name)
+{
+    lua_getglobal(L, func_name);
+    bool exists = lua_isfunction(L, -1);
+    lua_pop(L, 1);
+    return exists;
+}
+
+void run_auto_splitter_cycle(
+    lua_State* L,
+    bool memory_map_exists,
+    bool start_exists,
+    bool on_start_exists,
+    bool split_exists,
+    bool on_split_exists,
+    bool is_loading_exists,
+    bool reset_exists,
+    bool on_reset_exists,
+    bool update_exists)
+{
+    if ((update_exists && !update(L)) || !memory_map_exists) {
+        return;
+    }
+
+    read_address(L);
+
+    if (is_loading_exists) {
+        is_loading(L);
+    }
+
+    if (!atomic_load(&timer_started)) {
+        if (start_exists) {
+            start(L);
+        }
+    } else if (reset_exists) {
+        reset(L);
+    } else if (split_exists) {
+        split(L);
+    }
+
+    if (on_start_exists && atomic_load(&call_on_start)) {
+        call_va(L, "OnStart", "");
+        atomic_store(&call_on_start, false);
+    }
+
+    if (on_split_exists && atomic_load(&call_on_split)) {
+        call_va(L, "OnSplit", "");
+        atomic_store(&call_on_split, false);
+    }
+
+    if (on_reset_exists && atomic_load(&call_on_reset)) {
+        call_va(L, "OnReset", "");
+        atomic_store(&call_on_reset, false);
+    }
+
+    // Clear the memory maps cache if needed
+    maps_cache_cycles_value--;
+    if (maps_cache_cycles_value < 1) {
+        p_maps_cache_size = 0; // We dont need to "empty" the list as the elements after index 0 are considered invalid
+        maps_cache_cycles_value = maps_cache_cycles;
+        // printf("Cleared maps cache\n");
+    }
 }
 
 void run_auto_splitter()
 {
     lua_State* L = luaL_newstate();
-    luaL_openlibs(L);
-    disable_functions(L, disabled_functions);
-    lua_pushcfunction(L, find_process_id);
-    lua_setglobal(L, "process");
-    lua_pushcfunction(L, read_address);
-    lua_setglobal(L, "readAddress");
-    lua_pushcfunction(L, getPid);
-    lua_setglobal(L, "getPID");
-
-    char current_file[PATH_MAX];
-    strcpy(current_file, auto_splitter_file);
 
     // Load the Lua file
     if (luaL_loadfile(L, auto_splitter_file) != LUA_OK) {
-        // Error loading the file
-        const char* error_msg = lua_tostring(L, -1);
-        lua_pop(L, 1); // Remove the error message from the stack
-        fprintf(stderr, "Lua syntax error: %s\n", error_msg);
+        fprintf(stderr, "Lua syntax error: %s\n", lua_tostring(L, -1));
         lua_close(L);
         atomic_store(&auto_splitter_enabled, false);
         return;
@@ -342,42 +441,36 @@ void run_auto_splitter()
 
     // Execute the Lua file
     if (lua_pcall(L, 0, LUA_MULTRET, 0) != LUA_OK) {
-        // Error executing the file
-        const char* error_msg = lua_tostring(L, -1);
-        lua_pop(L, 1); // Remove the error message from the stack
-        fprintf(stderr, "Lua runtime error: %s\n", error_msg);
+        fprintf(stderr, "Lua runtime error: %s\n", lua_tostring(L, -1));
         lua_close(L);
         atomic_store(&auto_splitter_enabled, false);
         return;
     }
 
-    lua_getglobal(L, "state");
-    bool state_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'state' from the stack
+    luaL_openlibs(L);
+    disable_functions(L, disabled_functions);
+    lua_pushcfunction(L, getPid);
+    lua_setglobal(L, "getPID");
+    lua_newtable(L);
+    lua_setglobal(L, "vars");
 
-    lua_getglobal(L, "start");
-    bool start_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'start' from the stack
+    char current_file[PATH_MAX];
+    strcpy(current_file, auto_splitter_file);
 
-    lua_getglobal(L, "split");
-    bool split_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'split' from the stack
-
-    lua_getglobal(L, "isLoading");
-    bool is_loading_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'isLoading' from the stack
-
-    lua_getglobal(L, "startup");
-    bool startup_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'startup' from the stack
-
-    lua_getglobal(L, "reset");
-    bool reset_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'reset' from the stack
-
-    lua_getglobal(L, "update");
-    bool update_exists = lua_isfunction(L, -1);
-    lua_pop(L, 1); // Remove 'update' from the stack
+    bool start_exists = lua_function_exists(L, "Start");
+    bool on_start_exists = lua_function_exists(L, "OnStart");
+    bool split_exists = lua_function_exists(L, "Split");
+    bool on_split_exists = lua_function_exists(L, "OnSplit");
+    bool is_loading_exists = lua_function_exists(L, "IsLoading");
+    bool startup_exists = lua_function_exists(L, "Startup");
+    bool reset_exists = lua_function_exists(L, "Reset");
+    bool on_reset_exists = lua_function_exists(L, "OnReset");
+    bool update_exists = lua_function_exists(L, "Update");
+    bool init_exists = lua_function_exists(L, "Init");
+    bool memory_map_exists = false;
+    atomic_store(&call_on_start, false);
+    atomic_store(&call_on_split, false);
+    atomic_store(&call_on_reset, false);
 
     if (startup_exists) {
         startup(L);
@@ -386,45 +479,44 @@ void run_auto_splitter()
     printf("Refresh rate: %d\n", refresh_rate);
     int rate = 1000000 / refresh_rate;
 
+    char process_names[100][256];
+    int num_process_names = 0;
+    const char* version_str;
+    if (get_process_names(L, process_names, &num_process_names)) {
+        if (find_process_id(process_names, num_process_names)) {
+            if (init_exists) {
+                call_va(L, "Init", "");
+            }
+            lua_newtable(L);
+            lua_setglobal(L, "old");
+            lua_newtable(L);
+            lua_setglobal(L, "current");
+            version_str = version(L);
+            memory_map_exists = store_memory_tables(L, version_str);
+        }
+    }
+
     while (1) {
         struct timespec clock_start;
         clock_gettime(CLOCK_MONOTONIC, &clock_start);
 
-        if (!atomic_load(&auto_splitter_enabled) || strcmp(current_file, auto_splitter_file) != 0 || !process_exists() || process.pid == 0) {
+        if (!process_exists() && find_process_id(process_names, num_process_names) && init_exists) {
+            call_va(L, "Init", "");
+        } else if (!atomic_load(&auto_splitter_enabled) || strcmp(current_file, auto_splitter_file) != 0) {
             break;
         }
 
-        if (state_exists) {
-            state(L);
-        }
-
-        if (update_exists) {
-            update(L);
-        }
-
-        if (start_exists) {
-            start(L);
-        }
-
-        if (split_exists) {
-            split(L);
-        }
-
-        if (is_loading_exists) {
-            is_loading(L);
-        }
-
-        if (reset_exists) {
-            reset(L);
-        }
-
-        // Clear the memory maps cache if needed
-        maps_cache_cycles_value--;
-        if (maps_cache_cycles_value < 1) {
-            p_maps_cache_size = 0; // We dont need to "empty" the list as the elements after index 0 are considered invalid
-            maps_cache_cycles_value = maps_cache_cycles;
-            // printf("Cleared maps cache\n");
-        }
+        run_auto_splitter_cycle(
+            L,
+            memory_map_exists,
+            start_exists,
+            on_start_exists,
+            split_exists,
+            on_split_exists,
+            is_loading_exists,
+            reset_exists,
+            on_reset_exists,
+            update_exists);
 
         struct timespec clock_end;
         clock_gettime(CLOCK_MONOTONIC, &clock_end);

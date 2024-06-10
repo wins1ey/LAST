@@ -150,6 +150,7 @@ static gboolean ls_app_window_step(gpointer data)
     if (win->timer) {
         ls_timer_step(win->timer, now);
 
+        atomic_store(&timer_started, win->timer->started);
         if (atomic_load(&auto_splitter_enabled)) {
             if (atomic_load(&call_start) && !win->timer->loading) {
                 timer_start(win);

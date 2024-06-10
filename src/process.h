@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include <luajit.h>
+#include <lualib.h>
 
 struct game_process {
     const char* name;
@@ -23,7 +24,7 @@ extern uint32_t p_maps_cache_size;
 
 uintptr_t find_base_address(const char* module);
 int process_exists();
-int find_process_id(lua_State* L);
+int find_process_id(char process_names[100][256], int num_process_names);
 int getPid(lua_State* L);
 bool parseMapsLine(char* line, ProcessMap* map);
 

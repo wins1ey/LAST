@@ -1,9 +1,12 @@
 #include "timer.h"
 #include <jansson.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "auto-splitter.h"
 
 long long ls_time_now(void)
 {
@@ -597,6 +600,7 @@ int ls_timer_start(ls_timer* timer)
         if (!timer->started) {
             ++*timer->attempt_count;
             timer->started = 1;
+            atomic_store(&call_on_start, true);
         }
         timer->running = 1;
     }
@@ -641,6 +645,7 @@ int ls_timer_split(ls_timer* timer)
                 ls_timer_stop(timer);
                 ls_game_update_splits((ls_game*)timer->game, timer);
             }
+            atomic_store(&call_on_split, true);
             return timer->curr_split;
         }
     }
@@ -691,9 +696,11 @@ int ls_timer_reset(ls_timer* timer)
 {
     if (!timer->running) {
         if (timer->started && timer->time <= 0) {
+            atomic_store(&call_on_reset, true);
             return ls_timer_cancel(timer);
         }
         reset_timer(timer);
+        atomic_store(&call_on_reset, true);
         return 1;
     }
     return 0;

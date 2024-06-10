@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <luajit.h>
+#include <lualib.h>
 
 #include "auto-splitter.h"
 #include "process.h"
@@ -75,42 +76,54 @@ uintptr_t find_base_address(const char* module)
     return 0;
 }
 
-void stock_process_id(const char* pid_command)
+int stock_process_id(const char* pid_command, const char* process_name)
 {
     char pid_output[PATH_MAX + 100];
     pid_output[0] = '\0';
 
-    while (atomic_load(&auto_splitter_enabled)) {
-        execute_command(pid_command, pid_output);
-        process.pid = strtoul(pid_output, NULL, 10);
-        printf("\033[2J\033[1;1H"); // Clear the console
-        if (process.pid) {
-            size_t newlinePos = strcspn(pid_output, "\n");
-            if (newlinePos != strlen(pid_output) - 1 && pid_output[0] != '\0') {
-                printf("Multiple PID's found for process: %s\n", process.name);
-            }
-            break;
-        } else {
-            printf("%s isn't running.\n", process.name);
-            usleep(100000); // Sleep for 100ms
-        }
+    execute_command(pid_command, pid_output);
+    process.pid = strtoul(pid_output, NULL, 10);
+    if (process.pid) {
+        process.name = process_name;
+        return 1;
     }
-
-    printf("Process: %s\n", process.name);
-    printf("PID: %u\n", process.pid);
-    process.base_address = find_base_address(NULL);
-    process.dll_address = process.base_address;
+    return 0;
 }
 
-int find_process_id(lua_State* L)
+int find_process_id(char process_names[100][256], int num_process_names)
 {
-    process.name = lua_tostring(L, 1);
-    char command[256];
-    printf("\033[2J\033[1;1H"); // Clear the console
-    snprintf(command, sizeof(command), "pgrep \"%.*s\"", (int)strnlen(process.name, 15), process.name);
+    int found = 0;
 
-    stock_process_id(command);
+    while (atomic_load(&auto_splitter_enabled)) {
+        printf("\r\033[KSearching for processes: ");
+        for (int i = 0; i < num_process_names; i++) {
+            printf("%s", process_names[i]);
+            if (i < num_process_names - 1) {
+                printf(", ");
+            }
+        }
+        fflush(stdout);
 
+        for (int i = 0; i < num_process_names; i++) {
+            char command[256];
+            snprintf(command, sizeof(command), "pgrep \"%.*s\"", (int)strnlen(process_names[i], 15), process_names[i]);
+
+            if (stock_process_id(command, process_names[i])) {
+                found = 1;
+                break;
+            }
+        }
+
+        if (found) {
+            printf("\r\033[KProcess: %s\n", process.name);
+            printf("PID: %u\n", process.pid);
+            process.base_address = find_base_address(NULL);
+            process.dll_address = process.base_address;
+            return 1;
+        } else {
+            usleep(100000); // Sleep for 100ms before retrying
+        }
+    }
     return 0;
 }
 
